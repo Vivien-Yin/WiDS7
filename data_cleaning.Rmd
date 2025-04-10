@@ -1,0 +1,19 @@
+---
+title: "Data"
+author: "Liwen Yin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r}
+library(readxl)
+#training
+fmri <- read.csv("widsdatathon2025/TRAIN_NEW/TRAIN_FUNCTIONAL_CONNECTOME_MATRICES_new_36P_Pearson.csv")
+demos <- read_excel("widsdatathon2025/TRAIN_NEW/TRAIN_CATEGORICAL_METADATA_new.xlsx")
+quant <- read_excel("widsdatathon2025/TRAIN_NEW/TRAIN_QUANTITATIVE_METADATA_new.xlsx")
+response <- read_excel("widsdatathon2025/TRAIN_NEW/TRAINING_SOLUTIONS.xlsx")
+#testing
+demos_test <- read_excel("widsdatathon2025/TEST/TEST_CATEGORICAL.xlsx")
+fmri_test <- read.csv("widsdatathon2025/TEST/TEST_FUNCTIONAL_CONNECTOME_MATRICES.csv")
+quant_test <- read_excel("widsdatathon2025/TEST/TEST_QUANTITATIVE_METADATA.xlsx")
+```
+
