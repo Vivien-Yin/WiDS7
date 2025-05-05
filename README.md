@@ -12,5 +12,5 @@ Since we took several different approaches, the code is divided into several rmd
 - `EDA Code.R`: EDA
 - `WiDS_PCA`: PCA + Model
 - `Autoencoder.Rmd`: Autoencoder + Model
-- `Autoencoder Dimensionality reduction_.Rmd`: XGBoost was tuned via Bayesian Optimization on autoencoder-derived fMRI and meta features
-- `xgb_bayesopt_results.csv`: Bayesian Optimization Parameters & Results for XGBoost 
+- `Autoencoder Dimensionality reduction_.Rmd`: Bayesian optimization of XGBoost on compressed fMRI + meta features
+- `xgb_bayesopt_results.csv`: Bayesian Optimization Parameters & Results for XGBoost （Table）
