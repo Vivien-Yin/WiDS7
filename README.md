@@ -10,7 +10,7 @@ The challenge data can be found on the kaggle page (we were unable to upload it 
 Since we took several different approaches, the code is divided into several rmd files with the contents shown in the filenames. The report is also uploaded as pdf file.
 - `data_cleaning.Rmd`: Data cleaning
 - `EDA Code.Rmd`: EDA
-- `WiDS_PCA`: PCA + Model
+- `WiDS_PCA.Rmd`: PCA + Model
 - `Autoencoder.Rmd`: Autoencoder + Model
 - `Autoencoder Dimensionality reduction_.Rmd`: Bayesian optimization of XGBoost on compressed fMRI + meta features
 - `xgb_bayesopt_results.csv`: Bayesian Optimization Parameters & Results for XGBoost （Table）
