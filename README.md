@@ -1,7 +1,7 @@
 # WiDS Datathon++ 2025 University Challenge
 ## Age Prediction from fMRI Connectivity Data —Using Autoencoder and Regularized Regression
 
-### Author: Liwen Yin, Jin Wen Lin, Zilu sun, Xiaohan Shi | University | May 2025
+### Author: Liwen Yin, Jin Wen Lin, Zilu sun, Xiaohan Shi | Boston University | May 2025
 
 The objective of this project is to predict each individual’s age based on the fMRI data provided by Healthy Brain Network (HBN) and a metadata that includes demographic features. The fMRI data focused on each participant’s brain activity during the resting-state. 
 
