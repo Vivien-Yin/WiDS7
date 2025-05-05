@@ -1,0 +1,219 @@
+---
+title: "WiDS_PCA"
+author: "Xiaohan Shi"
+date: "2025-05-05"
+output: html_document
+---
+
+```{r}
+#fmri data
+library(readr)
+library(dplyr)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(glmnet)
+library(caret)
+
+tsv_files <- list.files("D:/WIDS-UNI/train_tsv/", pattern = "\\.tsv$", full.names = TRUE)
+extract_upper_tri <- function(file_path) {
+  mat <- as.matrix(read_tsv(file_path, col_names = FALSE))
+  upper_tri <- mat[upper.tri(mat, diag = FALSE)]  
+  return(upper_tri)
+}
+patient_data <- t(sapply(tsv_files, extract_upper_tri))
+patient_df <- as.data.frame(patient_data)
+rownames(patient_df) <- basename(tsv_files)
+library(tibble)
+patient_df <- rownames_to_column(patient_df, var = "participant_id")
+fmri <- patient_df
+fmri$participant_id <- substr(fmri$participant_id, 5, 16)
+fmri$participant_id <- sub("_.*", "", fmri$participant_id)
+
+#metadata
+meta_train <- read.csv("metadata/training_metadata.csv")
+meta_test <- read.csv("metadata/test_metadata.csv")
+#missing values of meta_train
+colSums(is.na(meta_train))
+#class of meta_train
+sapply(meta_train, class)
+#data cleaning
+
+#impute bmi by sex
+bmi_means <- meta_train %>%
+  group_by(sex) %>%
+  summarise(bmi_mean = mean(bmi, na.rm = TRUE))
+meta_train <- meta_train %>%
+  left_join(bmi_means, by = "sex") %>%
+  mutate(
+    bmi = ifelse(is.na(bmi), bmi_mean, bmi)  
+  ) %>%
+  select(-bmi_mean) 
+#turn NAs into Missing
+meta_train <- meta_train %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), "Missing", .)))
+
+# 1. Identify all numeric columns in meta_train, but exclude age (because it is target)
+num_cols <- names(meta_train)[sapply(meta_train, is.numeric)]
+num_cols <- setdiff(num_cols, "age")
+
+# 2. Calculate the mean/sd on meta_train
+train_means <- sapply(meta_train[num_cols], mean, na.rm = TRUE)
+train_sds   <- sapply(meta_train[num_cols], sd,   na.rm = TRUE)
+
+# 3. Standardize meta_train
+meta_train <- meta_train %>%
+  mutate(across(
+    all_of(num_cols),
+    ~ (. - train_means[cur_column()]) / train_sds[cur_column()]
+  ))
+#same for test data
+meta_test <- meta_test %>%
+  left_join(bmi_means, by = "sex") %>%
+  mutate(
+    bmi = ifelse(is.na(bmi), bmi_mean, bmi) 
+  ) %>%
+  select(-bmi_mean)  
+meta_test <- meta_test %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), "Missing", .)))
+
+cols_to_scale_test <- intersect(num_cols, names(meta_test))
+
+meta_test <- meta_test %>%
+  mutate(across(
+    all_of(cols_to_scale_test),
+    ~ (. - train_means[cur_column()]) / train_sds[cur_column()]
+  ))
+#merge fmri data with metadata
+data <- left_join(fmri,meta_train, by = "participant_id")
+#detect missing value
+sum(is.na(data))
+sum(is.na(meta_train))
+sum(is.na(fmri))
+anti_join(fmri, meta_train, by = "participant_id")
+
+
+columns_to_encode <- names(data)[sapply(data, is.character)]
+columns_to_encode <- setdiff(columns_to_encode, "participant_id")
+
+# 3. Create the dummyVars encoder（fullRank = TRUE, drop first level）
+dummies <- dummyVars(~ ., data = data[, columns_to_encode, drop = FALSE], fullRank = TRUE)
+
+# 4. code
+onehot_matrix <- predict(dummies, newdata = data)
+
+# 5. combine
+data2 <- bind_cols(
+  data %>% select(participant_id, where(is.numeric)),
+  as.data.frame(onehot_matrix)
+)
+```
+
+# Data preparation for PCA & PCA
+```{r}
+# drop age & particioant_id
+y_all <- data2$age
+x_all <- data2 %>% select(-participant_id, -age)
+
+# 1: Distinguish fMRI features from metadata
+fmri_cols <- grep("^V", names(x_all), value = TRUE)  # V1, V2,...for fMRI
+meta_cols <- setdiff(names(x_all), fmri_cols)
+
+# 2: split data
+set.seed(123)
+train_idx <- createDataPartition(y_all, p = 0.8, list = FALSE)
+fmri_train <- x_all[train_idx, fmri_cols]
+fmri_test  <- x_all[-train_idx, fmri_cols]
+meta_train <- x_all[train_idx, meta_cols]
+meta_test  <- x_all[-train_idx, meta_cols]
+y_train <- y_all[train_idx]
+y_test  <- y_all[-train_idx]
+
+# 3: PCA on fMRI_train
+pca_model <- prcomp(fmri_train, center = TRUE, scale. = TRUE)
+explained_var <- cumsum(pca_model$sdev^2) / sum(pca_model$sdev^2)
+num_pcs <- which(explained_var >= 0.9)[1]
+
+# 4: Transform fmri train/test
+fmri_train_pca <- as.data.frame(predict(pca_model, newdata = fmri_train)[, 1:num_pcs])
+fmri_test_pca  <- as.data.frame(predict(pca_model, newdata = fmri_test)[, 1:num_pcs])
+
+# 5: combine PCA + metadata
+x_train <- bind_cols(fmri_train_pca, meta_train)
+x_test <- bind_cols(fmri_test_pca, meta_test)
+
+num_pcs
+```
+
+# Modelling 
+```{r}
+# Ridge / Lasso / Elastic Net 
+models <- list()
+results <- data.frame(Model = character(), RMSE = numeric(), R2 = numeric())
+
+# Helper function
+calc_metrics <- function(pred, true) {
+  rmse <- sqrt(mean((pred - true)^2))
+  r2 <- 1 - sum((true - pred)^2) / sum((true - mean(true))^2)
+  return(list(rmse = rmse, r2 = r2))
+}
+
+set.seed(123)
+# Ridge
+ridge <- cv.glmnet(as.matrix(x_train), y_train, alpha = 0)
+pred <- predict(ridge, s = ridge$lambda.min, newx = as.matrix(x_test))
+m <- calc_metrics(pred, y_test)
+results <- rbind(results, data.frame(Model = "Ridge", RMSE = m$rmse, R2 = m$r2))
+models$ridge <- ridge
+
+# Lasso
+lasso <- cv.glmnet(as.matrix(x_train), y_train, alpha = 1)
+pred <- predict(lasso, s = lasso$lambda.min, newx = as.matrix(x_test))
+m <- calc_metrics(pred, y_test)
+results <- rbind(results, data.frame(Model = "Lasso", RMSE = m$rmse, R2 = m$r2))
+models$lasso <- lasso
+
+# Elastic Net
+enet <- cv.glmnet(as.matrix(x_train), y_train, alpha = 0.5)
+pred <- predict(enet, s = enet$lambda.min, newx = as.matrix(x_test))
+m <- calc_metrics(pred, y_test)
+results <- rbind(results, data.frame(Model = "Elastic Net", RMSE = m$rmse, R2 = m$r2))
+models$enet <- enet
+
+print(results)
+
+```
+
+# Residual of ridge
+```{r}
+ridge_pred <- predict(models$ridge, s = models$ridge$lambda.min, newx = as.matrix(x_test))
+
+# residuals 
+residuals <- y_test - ridge_pred
+
+par(mfrow = c(1, 2))
+
+# Residual Plot
+plot(ridge_pred, residuals, 
+     main = "Ridge Regression Residual Plot",
+     xlab = "Predicted Values", 
+     ylab = "Residuals",
+     pch = 19, 
+     col = "black", 
+     cex = 0.8)
+abline(h = 0, col = "red", lwd = 2, lty = 2)
+grid()
+
+# QQ plot
+qqnorm(residuals, 
+       main = "Normal Q-Q Plot for Ridge Residuals",
+       pch = 19, 
+       col = "black")
+qqline(residuals, col = "red", lwd = 2)  
+par(mfrow = c(1, 1))
+
+cat("Ridge Model Residuals Summary:\n")
+summary(residuals)
+```
+
