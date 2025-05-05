@@ -1,0 +1,723 @@
+---
+title: "Data"
+author: "Liwen Yin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+#read data
+```{r}
+#fmri data
+library(readr)
+library(dplyr)
+tsv_files <- list.files("widsdatathon2025-university/train_tsv/train_tsv/", pattern = "\\.tsv$", full.names = TRUE)
+extract_upper_tri <- function(file_path) {
+  mat <- as.matrix(read_tsv(file_path, col_names = FALSE))
+  upper_tri <- mat[upper.tri(mat, diag = FALSE)]  
+  return(upper_tri)
+}
+patient_data <- t(sapply(tsv_files, extract_upper_tri))
+patient_df <- as.data.frame(patient_data)
+rownames(patient_df) <- basename(tsv_files)
+library(tibble)
+patient_df <- rownames_to_column(patient_df, var = "participant_id")
+fmri <- patient_df
+fmri$participant_id <- substr(fmri$participant_id, 5, 16)
+fmri$participant_id <- sub("_.*", "", fmri$participant_id)
+```
+
+```{r}
+#fmri data
+library(readr)
+library(dplyr)
+tsv_test <- list.files("widsdatathon2025-university/test_tsv/test_tsv/", pattern = "\\.tsv$", full.names = TRUE)
+extract_upper_tri <- function(file_path) {
+  mat <- as.matrix(read_tsv(file_path, col_names = FALSE))
+  upper_tri <- mat[upper.tri(mat, diag = FALSE)]  
+  return(upper_tri)
+}
+patient_data <- t(sapply(tsv_test, extract_upper_tri))
+patient_df <- as.data.frame(patient_data)
+rownames(patient_df) <- basename(tsv_test)
+library(tibble)
+patient_df <- rownames_to_column(patient_df, var = "participant_id")
+fmri_test <- patient_df
+fmri_test$participant_id <- substr(fmri_test$participant_id, 5, 16)
+fmri_test$participant_id <- sub("_.*", "", fmri_test$participant_id)
+```
+
+#data cleaning
+```{r}
+library(dplyr)
+#metadata
+meta_train <- read.csv("widsdatathon2025-university/metadata/training_metadata.csv")
+meta_test <- read.csv("widsdatathon2025-university/metadata/test_metadata.csv")
+#missing values of meta_train
+colSums(is.na(meta_train))
+#class of meta_train
+sapply(meta_train, class)
+#data cleaning
+library(dplyr)
+#impute bmi by sex
+bmi_means <- meta_train %>%
+  group_by(sex) %>%
+  summarise(bmi_mean = mean(bmi, na.rm = TRUE))
+meta_train <- meta_train %>%
+  left_join(bmi_means, by = "sex") %>%
+  mutate(
+    bmi = ifelse(is.na(bmi), bmi_mean, bmi)  
+  ) %>%
+  select(-bmi_mean) 
+#turn NAs into Missing
+meta_train <- meta_train %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), "Missing", .)))
+library(dplyr)
+num_cols <- names(meta_train)[sapply(meta_train, is.numeric)]
+num_cols <- setdiff(num_cols, "age")
+train_means <- sapply(meta_train[num_cols], mean, na.rm = TRUE)
+train_sds   <- sapply(meta_train[num_cols], sd,   na.rm = TRUE)
+meta_train <- meta_train %>%
+  mutate(across(
+    all_of(num_cols),
+    ~ (. - train_means[cur_column()]) / train_sds[cur_column()]
+  ))
+
+#same for test data
+meta_test <- meta_test %>%
+  left_join(bmi_means, by = "sex") %>%
+  mutate(
+    bmi = ifelse(is.na(bmi), bmi_mean, bmi) 
+  ) %>%
+  select(-bmi_mean)  
+meta_test <- meta_test %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), "Missing", .)))
+
+cols_to_scale_test <- intersect(num_cols, names(meta_test))
+
+meta_test <- meta_test %>%
+  mutate(across(
+    all_of(cols_to_scale_test),
+    ~ (. - train_means[cur_column()]) / train_sds[cur_column()]
+  ))
+
+```
+#check the class of the data
+```{r}
+lapply(
+  meta_train[, sapply(meta_train, is.character) & names(meta_train) != "participant_id"],
+  unique
+)
+```
+#combine fmri data with metadata
+```{r}
+#merge fmri data with metadata
+data <- left_join(fmri,meta_train, by = "participant_id")
+#detect missing value
+sum(is.na(data))
+sum(is.na(meta_train))
+sum(is.na(fmri))
+anti_join(fmri, meta_train, by = "participant_id")
+
+test_data <-  left_join(fmri_test,meta_test, by = "participant_id")
+sum(is.na(test_data))
+sum(is.na(meta_test))
+sum(is.na(fmri_test))
+anti_join(fmri_test, meta_test, by = "participant_id")
+```
+#one-hot encoding for categorical data
+```{r}
+library(caret)
+columns_to_encode <- names(data)[sapply(data, is.character)]
+columns_to_encode <- setdiff(columns_to_encode, "participant_id")
+dummies <- dummyVars(~ ., data = data[, columns_to_encode, drop = FALSE], fullRank = TRUE)
+onehot_matrix <- predict(dummies, newdata = data)
+data2 <- bind_cols(
+  data %>% select(participant_id, where(is.numeric)),
+  as.data.frame(onehot_matrix)
+)
+#same for test data
+#the encoding scheme is identical to train data
+columns_to_encode <- names(test_data)[sapply(test_data, is.character)]
+columns_to_encode <- setdiff(columns_to_encode, "participant_id")
+onehot_matrix_test <- predict(dummies, newdata = test_data)
+test_data <- bind_cols(
+  test_data %>% select(participant_id, where(is.numeric)),
+  as.data.frame(onehot_matrix_test)
+)
+```
+
+#auto+XGboost(parameters tunning)
+```{r}
+library(keras)
+library(caret)
+library(xgboost)
+library(tensorflow)
+
+set.seed(123)
+train_idx <- createDataPartition(data2$age, p = 0.8, list = FALSE)
+train_set <- data2[train_idx, ]
+test_set  <- data2[-train_idx, ]
+
+fmri_cols <- names(data2)[2:(1 + 19901)]
+X_train   <- as.matrix(train_set[, fmri_cols])
+X_test    <- as.matrix(test_set[,  fmri_cols])
+y_train   <- train_set$age
+y_test    <- test_set$age
+
+input_dim  <- ncol(X_train)
+latent_dim <- 256
+
+
+inputs  <- layer_input(shape = input_dim)
+encoded <- inputs %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_dense(units = latent_dim, activation = "relu")
+decoded <- encoded %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_dense(units = input_dim, activation = "linear")
+
+autoencoder <- keras_model(inputs, decoded)
+encoder     <- keras_model(inputs, encoded)
+
+autoencoder %>% compile(
+  optimizer = optimizer_adam(lr = 1e-3),
+  loss      = "mse"
+)
+autoencoder %>% fit(
+  X_train, X_train,
+  epochs           = 50,
+  batch_size       = 32,
+  verbose          = 1
+)
+
+Z_train <- encoder %>% predict(X_train)
+Z_test  <- encoder %>% predict(X_test)
+
+train_df <- as.data.frame(Z_train)
+colnames(train_df) <- paste0("Z", seq_len(ncol(train_df)))
+train_df$age <- y_train
+
+xgb_grid <- expand.grid(
+  nrounds           = c(50, 100, 200),
+  eta               = c(0.01, 0.03, 0.05, 0.1),
+  max_depth         = c(3, 6, 9),
+  gamma             = 0,
+  colsample_bytree  = c(0.6, 0.8, 1.0),
+  min_child_weight  = 1,
+  subsample         = c(0.6, 0.8, 1.0)
+)
+tr_ctrl <- trainControl(
+  method        = "cv",
+  number        = 3,
+  verboseIter   = TRUE,
+  allowParallel = TRUE
+)
+
+set.seed(123)
+xgb_tune <- caret::train(
+  age ~ .,
+  data      = train_df,
+  method    = "xgbTree",
+  trControl = tr_ctrl,
+  tuneGrid  = xgb_grid,
+  metric    = "RMSE"
+)
+print(xgb_tune$bestTune)
+
+best <- xgb_tune$bestTune
+dtrain <- xgb.DMatrix(data = Z_train, label = y_train)
+dtest  <- xgb.DMatrix(data = Z_test,  label = y_test)
+
+final_params <- list(
+  objective        = "reg:squarederror",
+  eta              = best$eta,
+  max_depth        = best$max_depth,
+  subsample        = best$subsample,
+  colsample_bytree = best$colsample_bytree,
+  gamma            = best$gamma,
+  min_child_weight = best$min_child_weight,
+  eval_metric      = "rmse"
+)
+
+model <- xgb.train(
+  params  = final_params,
+  data    = dtrain,
+  nrounds = best$nrounds,
+  verbose = 1
+)
+
+preds <- predict(model, dtest)
+rmse  <- sqrt(mean((preds - y_test)^2))
+sst   <- sum((y_test - mean(y_test))^2)
+ssr   <- sum((preds - y_test)^2)
+r2    <- 1 - ssr / sst
+
+cat("Test RMSE:", round(rmse,4), "\n")
+cat("Test R²:  ", round(r2,  4), "\n")
+```
+#autoencoder+lasso
+```{r}
+library(keras)
+library(glmnet)
+library(caret)
+
+set.seed(42)
+
+data_shuf <- data2[sample(nrow(data2)), ]
+n <- nrow(data_shuf)
+n_test <- floor(0.2 * n)
+test_df <- data_shuf[1:n_test, ]
+train_df <- data_shuf[(n_test+1):n, ]
+
+fmri_cols <- names(data2)[2:19902]
+meta_cols <- setdiff(names(data2), c("participant_id", fmri_cols, "age"))
+
+X_fmri_train <- as.matrix(train_df[, fmri_cols])
+X_fmri_test  <- as.matrix(test_df[,  fmri_cols])
+
+input_dim <- ncol(X_fmri_train)
+latent_dim <- 256
+
+inputs <- layer_input(shape = input_dim)
+encoded <- inputs %>%
+  layer_dense(512, activation = "relu") %>%
+  layer_dense(latent_dim, activation = "relu")
+decoded <- encoded %>%
+  layer_dense(512, activation = "relu") %>%
+  layer_dense(input_dim, activation = "linear")
+
+autoencoder <- keras_model(inputs, decoded)
+encoder <- keras_model(inputs, encoded)
+
+autoencoder %>% compile(
+  optimizer = "adam",
+  loss = "mse"
+)
+
+autoencoder %>% fit(
+  x = X_fmri_train, y = X_fmri_train,
+  epochs = 50, batch_size = 32,
+  verbose = 1,
+  callbacks = list(
+    callback_early_stopping(monitor = "loss", patience = 5, restore_best_weights = TRUE)
+  )
+)
+
+Z_train <- encoder %>% predict(X_fmri_train)
+Z_test  <- encoder %>% predict(X_fmri_test)
+
+X_train <- cbind(Z_train, train_df[, meta_cols])
+X_test  <- cbind(Z_test,  test_df[, meta_cols])
+y_train <- train_df$age
+y_test  <- test_df$age
+
+train_complete <- complete.cases(X_train, y_train)
+test_complete  <- complete.cases(X_test, y_test)
+X_train <- X_train[train_complete, ]
+y_train <- y_train[train_complete]
+X_test  <- X_test[test_complete, ]
+y_test  <- y_test[test_complete]
+
+cv_fit <- cv.glmnet(as.matrix(X_train), y_train, alpha = 1, nfolds = 5)
+best_lambda <- cv_fit$lambda.min
+
+model <- glmnet(as.matrix(X_train), y_train, alpha = 1, lambda = best_lambda)
+preds <- predict(model, as.matrix(X_test))
+
+rmse <- sqrt(mean((preds - y_test)^2))
+r2 <- 1 - sum((y_test - preds)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Test RMSE:", round(rmse, 4), "\n")
+cat("Test R²:  ", round(r2, 4), "\n")
+```
+#Autoencoder with elastic net
+```{r}
+library(keras)
+library(caret)
+library(glmnet)
+
+set.seed(42)
+
+data_shuf <- data2[sample(nrow(data2)), ]
+n         <- nrow(data_shuf)
+n_test    <- floor(0.2 * n)
+test_df   <- data_shuf[1:n_test, ]
+train_df  <- data_shuf[(n_test+1):n, ]
+
+fmri_cols <- names(data2)[2:19902]
+meta_cols <- setdiff(names(data2), c("participant_id", fmri_cols, "age"))
+
+X_fmri_train <- as.matrix(train_df[, fmri_cols])
+X_fmri_test  <- as.matrix(test_df[,  fmri_cols])
+X_meta_train <- train_df[, meta_cols]
+X_meta_test  <- test_df[,  meta_cols]
+y_train      <- train_df$age
+y_test       <- test_df$age
+
+input_dim  <- ncol(X_fmri_train)
+latent_dim <- 256
+
+inputs <- layer_input(shape = input_dim)
+encoded <- inputs %>%
+  layer_dense(512, activation = "relu") %>%
+  layer_dense(latent_dim, activation = "relu")
+decoded <- encoded %>%
+  layer_dense(512, activation = "relu") %>%
+  layer_dense(input_dim, activation = "linear")
+
+autoencoder <- keras_model(inputs, decoded)
+encoder     <- keras_model(inputs, encoded)
+
+autoencoder %>% compile(optimizer = "adam", loss = "mse")
+
+autoencoder %>% fit(
+  x = X_fmri_train, y = X_fmri_train,
+  epochs = 50, batch_size = 32, verbose = 1,
+  callbacks = list(
+    callback_early_stopping(monitor = "loss", patience = 5, restore_best_weights = TRUE)
+  )
+)
+
+Z_train <- encoder %>% predict(X_fmri_train)
+Z_test  <- encoder %>% predict(X_fmri_test)
+
+X_train <- cbind(Z_train, X_meta_train)
+X_test  <- cbind(Z_test,  X_meta_test)
+
+train_complete <- complete.cases(X_train, y_train)
+test_complete  <- complete.cases(X_test,  y_test)
+X_train <- X_train[train_complete, ]
+y_train <- y_train[train_complete]
+X_test  <- X_test[test_complete, ]
+y_test  <- y_test[test_complete]
+
+set.seed(42)
+cv_fit <- cv.glmnet(as.matrix(X_train), y_train, alpha = 0.5, nfolds = 5)  # alpha=0.5 = Elastic Net
+best_lambda <- cv_fit$lambda.min
+
+model <- glmnet(as.matrix(X_train), y_train, alpha = 0.5, lambda = best_lambda)
+preds <- predict(model, as.matrix(X_test))
+
+rmse <- sqrt(mean((preds - y_test)^2))
+r2   <- 1 - sum((y_test - preds)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Elastic Net Test RMSE:", round(rmse, 4), "\n")
+cat("Elastic Net Test R²:  ", round(r2, 4), "\n")
+```
+# auto+elastic+para tunning
+```{r}
+library(dplyr)
+library(keras)
+library(caret)
+library(glmnet)
+
+set.seed(42)
+
+data_shuf <- data2[sample(nrow(data2)), ]
+n         <- nrow(data_shuf)
+n_test    <- floor(0.2 * n)
+test_df   <- data_shuf[1:n_test, ]
+train_df  <- data_shuf[(n_test+1):n, ]
+
+fmri_cols <- names(data2)[2:19902]
+meta_cols <- setdiff(names(data2), c("participant_id", fmri_cols, "age"))
+
+X_fmri_train <- as.matrix(train_df[, fmri_cols])
+X_fmri_test  <- as.matrix(test_df[,  fmri_cols])
+X_meta_train <- train_df[, meta_cols]
+X_meta_test  <- test_df[,  meta_cols]
+y_train      <- train_df$age
+y_test       <- test_df$age
+
+param_grid <- expand.grid(
+  latent_dim   = 256,
+  hidden_units = 256,
+  dropout      = 0
+)
+
+results <- data.frame()
+
+for (i in 1:nrow(param_grid)) {
+  cat("\n===== Running config", i, "=====\n")
+  
+  latent_dim   <- param_grid$latent_dim[i]
+  hidden_units <- param_grid$hidden_units[i]
+  dropout_rate <- param_grid$dropout[i]
+  
+
+  inputs <- layer_input(shape = ncol(X_fmri_train))
+  encoded <- inputs %>%
+    layer_dense(units = hidden_units, activation = "relu") %>%
+    { if (dropout_rate > 0) layer_dropout(., rate = dropout_rate) else . } %>%
+    layer_dense(units = latent_dim, activation = "relu")
+  decoded <- encoded %>%
+    layer_dense(units = hidden_units, activation = "relu") %>%
+    layer_dense(units = ncol(X_fmri_train), activation = "linear")
+  
+  autoencoder <- keras_model(inputs, decoded)
+  encoder     <- keras_model(inputs, encoded)
+  
+  autoencoder %>% compile(optimizer = "adam", loss = "mse")
+  
+  autoencoder %>% fit(
+    x = X_fmri_train, y = X_fmri_train,
+    epochs = 50, batch_size = 32, verbose = 0,
+    callbacks = list(
+      callback_early_stopping(monitor = "loss", patience = 5, restore_best_weights = TRUE)
+    )
+  )
+  
+  Z_train <- encoder %>% predict(X_fmri_train)
+  Z_test  <- encoder %>% predict(X_fmri_test)
+  X_train <- cbind(Z_train, X_meta_train)
+  colnames(X_train) <- c(paste0("latent_", 1:ncol(Z_train)), names(X_meta_train))
+  X_test  <- cbind(Z_test,  X_meta_test)
+  
+  train_complete <- complete.cases(X_train, y_train)
+  test_complete  <- complete.cases(X_test,  y_test)
+  X_train <- X_train[train_complete, ]
+  y_train <- y_train[train_complete]
+  X_test  <- X_test[test_complete, ]
+  y_test  <- y_test[test_complete]
+  
+  #Elastic Net
+  set.seed(42)
+  cv_fit <- cv.glmnet(as.matrix(X_train), y_train, alpha = 0.5, nfolds = 5)
+  best_lambda <- cv_fit$lambda.min
+  
+  model <- glmnet(as.matrix(X_train), y_train, alpha = 0.5, lambda = best_lambda)
+  preds <- predict(model, as.matrix(X_test))
+  
+  #RMSE & R²
+  rmse <- sqrt(mean((preds - y_test)^2))
+  r2   <- 1 - sum((y_test - preds)^2) / sum((y_test - mean(y_test))^2)
+  
+  results <- rbind(
+    results,
+    data.frame(latent_dim, hidden_units, dropout_rate, rmse = round(rmse, 4), r2 = round(r2, 4))
+  )
+}
+
+print(results)
+
+```
+# result test
+```{r}
+residuals <- y_test - as.vector(preds)
+
+
+plot(y_test, residuals,
+     xlab = "True Age", ylab = "Residuals",
+     main = "Residual Plot",
+     pch = 19, col = rgb(0, 0, 1, 0.5))
+abline(h = 0, col = "red", lty = 2)
+
+cat("Train R²:", round(cv_fit$glmnet.fit$dev.ratio[which(cv_fit$lambda == best_lambda)], 4), "\n")
+cat("Test R² :", round(r2, 4), "\n")
+cat("Train RMSE: (CV estimate):", round(min(cv_fit$cvm), 4), "\n")
+cat("Test RMSE:", round(rmse, 4), "\n")
+```
+#Autoencoder with lasso, ridge and Elastic net and boosting three models
+```{r}
+library(keras)
+library(caret)
+library(glmnet)
+library(nloptr)
+
+set.seed(42)
+
+data_shuf <- data2[sample(nrow(data2)), ]
+n         <- nrow(data_shuf)
+n_test    <- floor(0.2 * n)
+test_df   <- data_shuf[1:n_test, ]
+train_df  <- data_shuf[(n_test + 1):n, ]
+
+fmri_cols <- names(data2)[2:19902]
+meta_cols <- setdiff(names(data2), c("participant_id", fmri_cols, "age"))
+
+X_fmri_train <- as.matrix(train_df[, fmri_cols])
+X_fmri_test  <- as.matrix(test_df[,  fmri_cols])
+X_meta_train <- train_df[, meta_cols]
+X_meta_test  <- test_df[,  meta_cols]
+y_train <- train_df$age
+y_test  <- test_df$age
+
+latent_dim   <- 256
+hidden_units <- 128
+dropout_rate <- 0.0
+
+inputs <- layer_input(shape = ncol(X_fmri_train))
+encoded <- inputs %>%
+  layer_dense(units = hidden_units, activation = "relu") %>%
+  { if (dropout_rate > 0) layer_dropout(., rate = dropout_rate) else . } %>%
+  layer_dense(units = latent_dim, activation = "relu")
+decoded <- encoded %>%
+  layer_dense(units = hidden_units, activation = "relu") %>%
+  layer_dense(units = ncol(X_fmri_train), activation = "linear")
+
+autoencoder <- keras_model(inputs, decoded)
+encoder     <- keras_model(inputs, encoded)
+
+autoencoder %>% compile(optimizer = "adam", loss = "mse")
+
+autoencoder %>% fit(
+  x = X_fmri_train, y = X_fmri_train,
+  epochs = 50, batch_size = 32, verbose = 0,
+  callbacks = list(callback_early_stopping(monitor = "loss", patience = 5, restore_best_weights = TRUE))
+)
+
+Z_train <- encoder %>% predict(X_fmri_train)
+Z_test  <- encoder %>% predict(X_fmri_test)
+X_train <- cbind(Z_train, X_meta_train)
+X_test  <- cbind(Z_test,  X_meta_test)
+
+train_complete <- complete.cases(X_train, y_train)
+test_complete  <- complete.cases(X_test,  y_test)
+X_train <- X_train[train_complete, ]
+y_train <- y_train[train_complete]
+X_test  <- X_test[test_complete, ]
+y_test  <- y_test[test_complete]
+
+ridge_cv  <- cv.glmnet(as.matrix(X_train), y_train, alpha = 0,   nfolds = 5)
+lasso_cv  <- cv.glmnet(as.matrix(X_train), y_train, alpha = 1,   nfolds = 5)
+enet_cv   <- cv.glmnet(as.matrix(X_train), y_train, alpha = 0.5, nfolds = 5)
+
+ridge_pred <- predict(ridge_cv, newx = as.matrix(X_test), s = "lambda.min")
+lasso_pred <- predict(lasso_cv, newx = as.matrix(X_test), s = "lambda.min")
+enet_pred  <- predict(enet_cv,  newx = as.matrix(X_test),  s = "lambda.min")
+
+rmse_loss <- function(w, y_true, preds_list) {
+  pred <- w[1]*preds_list[[1]] + w[2]*preds_list[[2]] + w[3]*preds_list[[3]]
+  sqrt(mean((y_true - pred)^2))
+}
+
+eval_g_eq <- function(w, y_true, preds_list) sum(w) - 1
+
+opt <- nloptr::nloptr(
+  x0          = rep(1/3, 3),
+  eval_f      = rmse_loss,
+  lb          = c(0, 0, 0),
+  ub          = c(1, 1, 1),
+  eval_g_eq   = eval_g_eq,
+  opts        = list("algorithm" = "NLOPT_LN_COBYLA", "xtol_rel" = 1e-6),
+  y_true      = y_test,
+  preds_list  = list(ridge_pred, lasso_pred, enet_pred)
+)
+
+opt_weights <- opt$solution
+ensemble_pred <- opt_weights[1]*ridge_pred + opt_weights[2]*lasso_pred + opt_weights[3]*enet_pred
+
+rmse <- sqrt(mean((y_test - ensemble_pred)^2))
+r2   <- 1 - sum((y_test - ensemble_pred)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Optimized Weighted Ensemble RMSE:", round(rmse, 4), "\n")
+cat("Optimized Weighted Ensemble R²:  ", round(r2,   4), "\n")
+cat("Weights: ridge =", round(opt_weights[1], 3),
+    ", lasso =", round(opt_weights[2], 3),
+    ", elastic =", round(opt_weights[3], 3), "\n")
+```
+#residual plot and QQ plot to evaluate the model 
+```{r}
+library(ggplot2)
+library(gridExtra)
+enet_resid <- as.vector(y_test - enet_pred)
+enet_fitted <- as.vector(enet_pred)
+
+df_resid <- data.frame(Fitted = enet_fitted, Residual = enet_resid)
+
+
+p1 <- ggplot(df_resid, aes(x = Fitted, y = Residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residual Plot", x = "Predicted Age", y = "Residual (True - Predicted)") +
+  theme_minimal()
+
+df_qq <- data.frame(resid = enet_resid)
+p2 <- ggplot(df_qq, aes(sample = resid)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(title = "QQ Plot of Residuals") +
+  theme_minimal()
+
+
+grid.arrange(p1, p2, ncol = 2)
+```
+#predict age on test data
+```{r}
+library(dplyr)
+library(keras)
+library(caret)
+library(glmnet)
+library(openxlsx)
+
+set.seed(42)
+
+data_shuf <- data2[sample(nrow(data2)), ]
+n <- nrow(data_shuf)
+n_test <- floor(0.2 * n)
+train_df <- data_shuf[(n_test+1):n, ]
+
+fmri_cols <- names(data2)[2:19901]
+meta_cols <- setdiff(names(data2), c("participant_id", fmri_cols, "age"))
+
+X_fmri_train <- as.matrix(train_df[, fmri_cols])
+X_meta_train <- train_df[, meta_cols]
+y_train <- train_df$age
+
+latent_dim <- 256
+hidden_units <- 256
+dropout_rate <- 0
+
+inputs <- layer_input(shape = ncol(X_fmri_train))
+encoded <- inputs %>%
+  layer_dense(units = hidden_units, activation = "relu") %>%
+  { if (dropout_rate > 0) layer_dropout(., rate = dropout_rate) else . } %>%
+  layer_dense(units = latent_dim, activation = "relu")
+decoded <- encoded %>%
+  layer_dense(units = hidden_units, activation = "relu") %>%
+  layer_dense(units = ncol(X_fmri_train), activation = "linear")
+
+autoencoder <- keras_model(inputs, decoded)
+encoder <- keras_model(inputs, encoded)
+
+autoencoder %>% compile(optimizer = "adam", loss = "mse")
+autoencoder %>% fit(
+  x = X_fmri_train, y = X_fmri_train,
+  epochs = 50, batch_size = 32, verbose = 0,
+  callbacks = list(callback_early_stopping(monitor = "loss", patience = 5, restore_best_weights = TRUE))
+)
+
+Z_train <- encoder %>% predict(X_fmri_train)
+X_train <- cbind(Z_train, X_meta_train)
+colnames(X_train) <- c(paste0("latent_", 1:ncol(Z_train)), names(X_meta_train))
+complete_idx <- complete.cases(X_train, y_train)
+X_train <- X_train[complete_idx, ]
+y_train <- y_train[complete_idx]
+
+cv_fit <- cv.glmnet(as.matrix(X_train), y_train, alpha = 0.5, nfolds = 5)
+best_lambda <- cv_fit$lambda.min
+model <- glmnet(as.matrix(X_train), y_train, alpha = 0.5, lambda = best_lambda)
+
+#prediction in test_data
+fmri_cols2 <- intersect(names(test_data), names(data2)[2:19901])
+X_fmri_test <- as.matrix(test_data[, fmri_cols2])
+X_meta_test <- test_data[, meta_cols]
+Z_test <- encoder %>% predict(X_fmri_test)
+
+stopifnot(nrow(Z_test) == nrow(X_meta_test))
+
+X_test_final <- cbind(Z_test, X_meta_test)
+colnames(X_test_final) <- c(paste0("latent_", 1:ncol(Z_test)), names(X_meta_test))
+complete_test_idx <- complete.cases(X_test_final)
+X_test_final <- X_test_final[complete_test_idx, ]
+
+#predict age
+pred_test_age <- predict(model, as.matrix(X_test_final))
+
+#Export as Excel file
+output_df <- data.frame(
+  participant_id = test_data$participant_id[complete_test_idx],
+  predicted_age = round(as.numeric(pred_test_age),2)
+)
+write.xlsx(output_df, "widsdatathon2025-university/predicted_age_results.xlsx", rowNames = FALSE)
+```
+
