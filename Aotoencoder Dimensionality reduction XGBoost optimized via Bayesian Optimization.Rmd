@@ -1,0 +1,296 @@
+---
+title: '5.4'
+author: "Zilu Sun"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+#fmri data
+library(readr)
+library(dplyr)
+tsv_files <- list.files("train_tsv", pattern = "\\.tsv$", full.names = TRUE)
+extract_upper_tri <- function(file_path) {
+  mat <- as.matrix(read_tsv(file_path, col_names = FALSE))
+  upper_tri <- mat[upper.tri(mat, diag = FALSE)]  
+  return(upper_tri)
+}
+patient_data <- t(sapply(tsv_files, extract_upper_tri))
+patient_df <- as.data.frame(patient_data)
+rownames(patient_df) <- basename(tsv_files)
+library(tibble)
+patient_df <- rownames_to_column(patient_df, var = "participant_id")
+fmri <- patient_df
+fmri$participant_id <- substr(fmri$participant_id, 5, 16)
+fmri$participant_id <- sub("_.*", "", fmri$participant_id)
+library(dplyr)
+#metadata
+meta_train <- read.csv("training_metadata.csv")
+meta_test <- read.csv("test_metadata.csv")
+#missing values of meta_train
+colSums(is.na(meta_train))
+#class of meta_train
+sapply(meta_train, class)
+#data cleaning
+library(dplyr)
+#impute bmi by sex
+bmi_means <- meta_train %>%
+  group_by(sex) %>%
+  summarise(bmi_mean = mean(bmi, na.rm = TRUE))
+meta_train <- meta_train %>%
+  left_join(bmi_means, by = "sex") %>%
+  mutate(
+    bmi = ifelse(is.na(bmi), bmi_mean, bmi)  
+  ) %>%
+  select(-bmi_mean) 
+#turn NAs into Missing
+meta_train <- meta_train %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), "Missing", .)))
+library(dplyr)
+num_cols <- names(meta_train)[sapply(meta_train, is.numeric)]
+num_cols <- setdiff(num_cols, "age")
+
+train_means <- sapply(meta_train[num_cols], mean, na.rm = TRUE)
+train_sds   <- sapply(meta_train[num_cols], sd,   na.rm = TRUE)
+
+meta_train <- meta_train %>%
+  mutate(across(
+    all_of(num_cols),
+    ~ (. - train_means[cur_column()]) / train_sds[cur_column()]
+  ))
+#same for test data
+meta_test <- meta_test %>%
+  left_join(bmi_means, by = "sex") %>%
+  mutate(
+    bmi = ifelse(is.na(bmi), bmi_mean, bmi) 
+  ) %>%
+  select(-bmi_mean)  
+meta_test <- meta_test %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), "Missing", .)))
+
+cols_to_scale_test <- intersect(num_cols, names(meta_test))
+
+meta_test <- meta_test %>%
+  mutate(across(
+    all_of(cols_to_scale_test),
+    ~ (. - train_means[cur_column()]) / train_sds[cur_column()]
+  ))
+#merge fmri data with metadata
+data <- left_join(fmri,meta_train, by = "participant_id")
+#detect missing value
+sum(is.na(data))
+sum(is.na(meta_train))
+sum(is.na(fmri))
+anti_join(fmri, meta_train, by = "participant_id")
+library(caret)
+columns_to_encode <- names(data)[sapply(data, is.character)]
+columns_to_encode <- setdiff(columns_to_encode, "participant_id")
+dummies <- dummyVars(~ ., data = data[, columns_to_encode, drop = FALSE], fullRank = TRUE)
+onehot_matrix <- predict(dummies, newdata = data)
+data2 <- bind_cols(
+  data %>% select(participant_id, where(is.numeric)),
+  as.data.frame(onehot_matrix)
+)
+```
+
+```{r}
+library(torch)
+library(dplyr)
+library(xgboost)
+library(rBayesianOptimization)
+
+fmri_cols <- names(data2)[2:19902]
+meta_cols <- setdiff(names(data2), c("participant_id", "age", fmri_cols))
+
+X_fmri <- as.matrix(data2[, fmri_cols])
+X_meta <- as.matrix(data2[, meta_cols])
+y_all  <- data2$age
+
+set.seed(42)
+n <- nrow(data2)
+n_test <- floor(0.2 * n)
+shuf_idx <- sample(1:n)
+
+X_fmri <- X_fmri[shuf_idx, ]
+X_meta <- X_meta[shuf_idx, ]
+y_all  <- y_all[shuf_idx]
+
+X_fmri_train <- X_fmri[-(1:n_test), ]
+X_fmri_test  <- X_fmri[1:n_test, ]
+X_meta_train <- X_meta[-(1:n_test), ]
+X_meta_test  <- X_meta[1:n_test, ]
+y_train      <- y_all[-(1:n_test)]
+y_test       <- y_all[1:n_test]
+
+fmri_mean <- apply(X_fmri_train, 2, mean)
+fmri_sd   <- apply(X_fmri_train, 2, sd)
+X_fmri_train <- scale(X_fmri_train, center = fmri_mean, scale = fmri_sd)
+X_fmri_test  <- scale(X_fmri_test, center = fmri_mean, scale = fmri_sd)
+
+latent_dim <- 256
+input_dim <- ncol(X_fmri_train)
+
+autoencoder <- nn_module(
+  initialize = function() {
+    self$encoder <- nn_sequential(
+      nn_linear(input_dim, 512),
+      nn_relu(),
+      nn_dropout(0.3),
+      nn_linear(512, latent_dim)
+    )
+    self$decoder <- nn_sequential(
+      nn_linear(latent_dim, 512),
+      nn_relu(),
+      nn_dropout(0.3),
+      nn_linear(512, input_dim)
+    )
+  },
+  forward = function(x) {
+    encoded <- self$encoder(x)
+    decoded <- self$decoder(encoded)
+    list(encoded = encoded, decoded = decoded)
+  }
+)
+
+model <- autoencoder()
+optimizer <- optim_adam(model$parameters, lr = 1e-3)
+loss_fn <- nn_mse_loss()
+
+X_train_torch <- torch_tensor(X_fmri_train, dtype = torch_float())
+batch_size <- 64
+n_epochs <- 100
+n_batches <- ceiling(nrow(X_fmri_train) / batch_size)
+
+best_loss <- Inf
+patience <- 10
+no_improve <- 0
+
+for (epoch in 1:n_epochs) {
+  model$train()
+  total_loss <- 0
+  
+  for (i in 1:n_batches) {
+    idx <- ((i - 1) * batch_size + 1):min(i * batch_size, nrow(X_fmri_train))
+    x_batch <- X_train_torch[idx, ]
+    
+    optimizer$zero_grad()
+    out <- model(x_batch)
+    loss <- loss_fn(out$decoded, x_batch)
+    loss$backward()
+    optimizer$step()
+    
+    total_loss <- total_loss + loss$item()
+  }
+
+  val_loss <- total_loss / n_batches
+  if (epoch %% 5 == 0) cat(sprintf("Epoch %d - Val Loss: %.4f\n", epoch, val_loss))
+  
+  if (val_loss < best_loss) {
+    best_loss <- val_loss
+    no_improve <- 0
+    torch_save(model$state_dict(), "best_autoencoder.pt")
+  } else {
+    no_improve <- no_improve + 1
+    if (no_improve >= patience) {
+      cat("Early stopping at epoch", epoch, "\n")
+      break
+    }
+  }
+}
+
+model$load_state_dict(torch_load("best_autoencoder.pt"))
+model$eval()
+
+X_fmri_train_encoded <- as_array(model$encoder(torch_tensor(X_fmri_train, dtype = torch_float())))
+X_fmri_test_encoded  <- as_array(model$encoder(torch_tensor(X_fmri_test,  dtype = torch_float())))
+
+X_train_final <- cbind(X_fmri_train_encoded, X_meta_train)
+X_test_final  <- cbind(X_fmri_test_encoded,  X_meta_test)
+
+dtrain <- xgb.DMatrix(data = X_train_final, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test_final,  label = y_test)
+
+opt_func <- function(eta, max_depth, subsample, colsample_bytree, gamma) {
+  params <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = eta,
+    max_depth = as.integer(max_depth),
+    subsample = subsample,
+    colsample_bytree = colsample_bytree,
+    gamma = gamma
+  )
+  
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 300,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  
+  list(Score = -min(cv$evaluation_log$test_rmse_mean), Pred = 0)
+}
+
+set.seed(42)
+opt <- BayesianOptimization(
+  FUN = opt_func,
+  bounds = list(
+    eta = c(0.01, 0.1),
+    max_depth = c(3L, 9L),
+    subsample = c(0.6, 1.0),
+    colsample_bytree = c(0.6, 1.0),
+    gamma = c(0, 0.2)
+  ),
+  init_points = 10,
+  n_iter = 20
+)
+
+best <- opt$Best_Par
+final_params <- list(
+  objective = "reg:squarederror",
+  eta = best[["eta"]],
+  max_depth = as.integer(best[["max_depth"]]),
+  subsample = best[["subsample"]],
+  colsample_bytree = best[["colsample_bytree"]],
+  gamma = best[["gamma"]],
+  eval_metric = "rmse"
+)
+
+model_final <- xgb.train(
+  params = final_params,
+  data = dtrain,
+  nrounds = 300,
+  early_stopping_rounds = 20,
+  watchlist = list(train = dtrain, test = dtest),
+  verbose = 1
+)
+
+# ---- 8. 最终评估 ----
+preds <- predict(model_final, dtest)
+rmse <- sqrt(mean((preds - y_test)^2))
+r2   <- 1 - sum((preds - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+cat("\n===== Final Test Results =====\n")
+cat("Final Test RMSE:", round(rmse, 4), "\n")
+cat("Final Test R²:", round(r2, 4), "\n")
+
+```
+
+```{r}
+var_y_test <- var(y_test)
+result_table <- opt$History %>%
+  dplyr::select(eta, max_depth, subsample, colsample_bytree, gamma, Value) %>%
+  mutate(
+    RMSE = -Value,
+    R2 = 1 - (RMSE^2) / var_y_test
+  ) %>%
+  arrange(RMSE)
+head(result_table, 10
+write.csv(result_table, "xgb_bayesopt_results.csv", row.names = FALSE)
+
+```
+
+
+
