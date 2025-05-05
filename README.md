@@ -14,3 +14,4 @@ Since we took several different approaches, the code is divided into several rmd
 - `Autoencoder.Rmd`: Autoencoder + Model
 - `Autoencoder Dimensionality reduction_.Rmd`: Bayesian optimization of XGBoost on compressed fMRI + meta features
 - `xgb_bayesopt_results.csv`: Bayesian Optimization Parameters & Results for XGBoost （Table）
+- `predicted_age_results.xlsx`: Predicted age result based on Kaggle competation's testing data (without target variable age)
